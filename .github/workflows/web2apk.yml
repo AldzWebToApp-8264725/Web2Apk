@@ -1,0 +1,611 @@
+name: Web to APK Builder
+
+on:
+  workflow_dispatch:
+    inputs:
+      web_url:
+        description: 'Website URL'
+        required: true
+        type: string
+      app_name:
+        description: 'App Name'
+        required: true
+        type: string
+      icon_url:
+        description: 'Icon URL (optional)'
+        required: false
+        type: string
+
+jobs:
+  build:
+    name: Build Web to APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Install ImageMagick
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq imagemagick
+          convert -version
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.0'
+          channel: 'stable'
+          cache: true
+
+      - name: Flutter Doctor
+        run: |
+          flutter doctor -v
+          flutter --version
+
+      - name: Create Flutter Project
+        id: project
+        run: |
+          APP_NAME="${{ github.event.inputs.app_name }}"
+          PACKAGE_NAME=$(echo "$APP_NAME" | tr ' ' '_' | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9_]//g')
+          echo "package_name=$PACKAGE_NAME" >> $GITHUB_OUTPUT
+          
+          echo "📱 Creating Flutter project: $APP_NAME"
+          
+          flutter create \
+            --org com.web2app \
+            --project-name "$PACKAGE_NAME" \
+            --platforms android \
+            "$PACKAGE_NAME"
+          
+          cd "$PACKAGE_NAME"
+          
+          echo "🖼️ Downloading icon..."
+          mkdir -p assets/icon
+          
+          ICON_URL="${{ github.event.inputs.icon_url }}"
+          ICON_FILE="assets/icon/icon.png"
+          BG_COLOR="#1565C0"
+          
+          create_default_icon() {
+            echo "🎨 Creating default icon with app initials"
+            convert -size 512x512 xc:"$BG_COLOR" -fill white -gravity center -pointsize 240 -font Helvetica -draw "text 0,0 '${APP_NAME:0:2}'" "$ICON_FILE"
+          }
+          
+          if [ -n "$ICON_URL" ] && [ "$ICON_URL" != "null" ] && [ "$ICON_URL" != "" ]; then
+            echo "📥 Downloading from: $ICON_URL"
+            if curl -f -L --max-time 30 -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" -o "$ICON_FILE" "$ICON_URL" 2>/dev/null; then
+              echo "✅ Download complete"
+              FILE_TYPE=$(file -b --mime-type "$ICON_FILE" 2>/dev/null || echo "")
+              if [[ "$FILE_TYPE" == image/* ]]; then
+                echo "✅ Valid image downloaded"
+                # cover-fill: gambar mengisi penuh 512x512 (tanpa bar putih di
+                # tepi) supaya logo tampak lebih besar; kelebihan gambar di-crop.
+                convert "$ICON_FILE" -resize 512x512^ -gravity center -extent 512x512 -background white -flatten "$ICON_FILE" 2>/dev/null || true
+              else
+                create_default_icon
+              fi
+            else
+              create_default_icon
+            fi
+          else
+            create_default_icon
+          fi
+          
+          if [ ! -f "$ICON_FILE" ] || [ ! -s "$ICON_FILE" ]; then
+            create_default_icon
+          fi
+          
+          echo "✅ Icon ready:"
+          ls -la assets/icon/
+
+      - name: Update Pubspec
+        run: |
+          cd "${{ steps.project.outputs.package_name }}"
+          
+          cat > pubspec.yaml << 'EOF'
+          name: webapp
+          description: Web to APK App
+          version: 1.0.0+1
+          environment:
+            sdk: ">=3.0.0 <4.0.0"
+          dependencies:
+            flutter:
+              sdk: flutter
+            webview_flutter: ^4.4.0
+            url_launcher: ^6.3.0
+            connectivity_plus: ^6.0.0
+            permission_handler: ^11.3.0
+          dev_dependencies:
+            flutter_test:
+              sdk: flutter
+            flutter_lints: ^4.0.0
+          flutter:
+            uses-material-design: true
+            assets:
+              - assets/icon/
+          EOF
+          
+          flutter pub get
+
+      - name: Generate App Icons (Legacy + Adaptive)
+        run: |
+          cd "${{ steps.project.outputs.package_name }}"
+          
+          echo "🖼️ Generating app icons..."
+          
+          ICON_PATH="assets/icon/icon.png"
+          APP_NAME="${{ github.event.inputs.app_name }}"
+          BG_COLOR="#1565C0"
+          
+          if [ ! -f "$ICON_PATH" ] || [ ! -s "$ICON_PATH" ]; then
+            echo "🎨 Creating default icon..."
+            convert -size 512x512 xc:"$BG_COLOR" -fill white -gravity center -pointsize 240 -font Helvetica -draw "text 0,0 '${APP_NAME:0:2}'" "$ICON_PATH"
+          fi
+          
+          for density in hdpi mdpi xhdpi xxhdpi xxxhdpi; do
+            mkdir -p "android/app/src/main/res/mipmap-$density"
+          done
+          mkdir -p "android/app/src/main/res/mipmap-anydpi-v26"
+          mkdir -p "android/app/src/main/res/values"
+          
+          # ========== 1) LEGACY ROUND ICON (Android < 8, dan launcher lama) ==========
+          # Catatan: langsung ke 512x512, TANPA upscale-lalu-crop, supaya konten
+          # icon tidak ter-zoom/terpotong dan tetap penuh sampai ke tepi.
+          echo "📐 Creating full-bleed round icon..."
+          convert "$ICON_PATH" -resize 512x512 -gravity center -extent 512x512 \
+            \( -size 512x512 xc:black -fill white -draw "circle 256,256 256,0" \) \
+            -alpha Off -compose CopyOpacity -composite \
+            final_round_icon.png
+          
+          convert final_round_icon.png -resize 72x72 android/app/src/main/res/mipmap-hdpi/ic_launcher.png
+          convert final_round_icon.png -resize 48x48 android/app/src/main/res/mipmap-mdpi/ic_launcher.png
+          convert final_round_icon.png -resize 96x96 android/app/src/main/res/mipmap-xhdpi/ic_launcher.png
+          convert final_round_icon.png -resize 144x144 android/app/src/main/res/mipmap-xxhdpi/ic_launcher.png
+          convert final_round_icon.png -resize 192x192 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher.png
+          
+          for density in hdpi mdpi xhdpi xxhdpi xxxhdpi; do
+            cp "android/app/src/main/res/mipmap-$density/ic_launcher.png" "android/app/src/main/res/mipmap-$density/ic_launcher_round.png" 2>/dev/null || true
+          done
+          
+          rm -f final_round_icon.png
+          
+          # ========== 2) ADAPTIVE ICON (Android 8+/Pixel/One UI, dll) ==========
+          # Tanpa ini, Android 8+ otomatis mengecilkan legacy icon (+padding ekstra)
+          # sehingga icon tampak jauh lebih kecil dibanding app lain. Dengan
+          # adaptive icon asli (background + foreground), icon tampil penuh/besar
+          # sesuai bentuk mask launcher (bulat/kotak membulat/tetesan air, dst).
+          echo "📐 Creating adaptive icon (foreground + background)..."
+          
+          convert "$ICON_PATH" -resize 72x72 -gravity center -extent 72x72 android/app/src/main/res/mipmap-hdpi/ic_launcher_foreground.png
+          convert "$ICON_PATH" -resize 48x48 -gravity center -extent 48x48 android/app/src/main/res/mipmap-mdpi/ic_launcher_foreground.png
+          convert "$ICON_PATH" -resize 96x96 -gravity center -extent 96x96 android/app/src/main/res/mipmap-xhdpi/ic_launcher_foreground.png
+          convert "$ICON_PATH" -resize 144x144 -gravity center -extent 144x144 android/app/src/main/res/mipmap-xxhdpi/ic_launcher_foreground.png
+          convert "$ICON_PATH" -resize 192x192 -gravity center -extent 192x192 android/app/src/main/res/mipmap-xxxhdpi/ic_launcher_foreground.png
+          
+          cat > android/app/src/main/res/values/colors.xml << EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_launcher_background">$BG_COLOR</color>
+          </resources>
+          EOF
+          
+          cat > android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml << 'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background"/>
+              <foreground android:drawable="@mipmap/ic_launcher_foreground"/>
+          </adaptive-icon>
+          EOF
+          
+          cp android/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml \
+             android/app/src/main/res/mipmap-anydpi-v26/ic_launcher_round.xml
+          
+          echo "✅ Legacy + Adaptive icons generated!"
+          find android/app/src/main/res -name "ic_launcher*" -exec file {} \; | head -20
+
+      # ==================== CREATE MAIN.DART ====================
+      - name: Create Main Activity
+        run: |
+          cd "${{ steps.project.outputs.package_name }}"
+          
+          APP_NAME="${{ github.event.inputs.app_name }}"
+          WEB_URL="${{ github.event.inputs.web_url }}"
+          
+          echo "🔐 Mengenkripsi URL website sebelum di-build..."
+          ENCRYPTED_DATA=$(WEB_URL="$WEB_URL" python3 << 'PYEOF'
+          import os, base64, secrets
+          url = os.environ['WEB_URL']
+          key = secrets.token_bytes(16)
+          url_bytes = url.encode('utf-8')
+          encrypted = bytes(b ^ key[i % len(key)] for i, b in enumerate(url_bytes))
+          print(base64.b64encode(encrypted).decode('utf-8'))
+          print(key.hex())
+          PYEOF
+          )
+          ENCRYPTED_URL=$(echo "$ENCRYPTED_DATA" | sed -n '1p')
+          ENCRYPTION_KEY=$(echo "$ENCRYPTED_DATA" | sed -n '2p')
+          echo "✅ URL berhasil dienkripsi (tidak akan tampil sebagai teks polos di APK)"
+          
+          cat > lib/main.dart << 'EOF'
+          import 'dart:async';
+          import 'dart:convert';
+          import 'package:flutter/material.dart';
+          import 'package:webview_flutter/webview_flutter.dart';
+          import 'package:connectivity_plus/connectivity_plus.dart';
+          
+          void main() => runApp(const MyApp());
+          
+          class MyApp extends StatelessWidget {
+            const MyApp({super.key});
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: 'APP_NAME_PLACEHOLDER',
+                theme: ThemeData(primarySwatch: Colors.blue, useMaterial3: true),
+                home: const WebViewScreen(),
+                debugShowCheckedModeBanner: false,
+              );
+            }
+          }
+          
+          class WebViewScreen extends StatefulWidget {
+            const WebViewScreen({super.key});
+            @override
+            State<WebViewScreen> createState() => _WebViewScreenState();
+          }
+          
+          class _WebViewScreenState extends State<WebViewScreen> {
+            late final WebViewController controller;
+            bool isLoading = true;
+            bool hasError = false;
+            StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
+          
+            static const String _encryptedUrl = 'ENCRYPTED_URL_PLACEHOLDER';
+            static const String _encryptionKey = 'ENCRYPTION_KEY_PLACEHOLDER';
+            late final String _targetUrl;
+          
+            // Dekripsi URL (XOR + Base64) agar link asli tidak terlihat
+            // sebagai teks polos saat APK di-decompile / dibuka dengan strings.
+            String _decryptUrl(String encryptedBase64, String keyHex) {
+              final encryptedBytes = base64Decode(encryptedBase64);
+              final keyBytes = <int>[
+                for (int i = 0; i < keyHex.length; i += 2)
+                  int.parse(keyHex.substring(i, i + 2), radix: 16)
+              ];
+              final decryptedBytes = List<int>.generate(
+                encryptedBytes.length,
+                (i) => encryptedBytes[i] ^ keyBytes[i % keyBytes.length],
+              );
+              return utf8.decode(decryptedBytes);
+            }
+          
+            @override
+            void initState() {
+              super.initState();
+              _targetUrl = _decryptUrl(_encryptedUrl, _encryptionKey);
+              _setupController();
+              _checkAndLoad();
+              _listenConnectivity();
+            }
+          
+            @override
+            void dispose() {
+              _connectivitySub?.cancel();
+              super.dispose();
+            }
+          
+            void _listenConnectivity() {
+              _connectivitySub =
+                  Connectivity().onConnectivityChanged.listen((results) {
+                final offline = results.contains(ConnectivityResult.none);
+                if (offline && !hasError) {
+                  setState(() {
+                    hasError = true;
+                    isLoading = false;
+                  });
+                } else if (!offline && hasError) {
+                  _checkAndLoad();
+                }
+              });
+            }
+          
+            Future<void> _checkAndLoad() async {
+              final result = await Connectivity().checkConnectivity();
+              final offline = result.contains(ConnectivityResult.none);
+              if (offline) {
+                setState(() {
+                  hasError = true;
+                  isLoading = false;
+                });
+                return;
+              }
+              setState(() {
+                hasError = false;
+                isLoading = true;
+              });
+              controller.loadRequest(Uri.parse(_targetUrl));
+            }
+          
+            void _setupController() {
+              controller = WebViewController()
+                ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                ..setBackgroundColor(const Color(0x00000000))
+                ..setNavigationDelegate(
+                  NavigationDelegate(
+                    onPageStarted: (String url) {
+                      setState(() { isLoading = true; hasError = false; });
+                    },
+                    onPageFinished: (String url) {
+                      setState(() { isLoading = false; });
+                    },
+                    onWebResourceError: (WebResourceError error) {
+                      final isMainFrame = error.isForMainFrame ?? true;
+                      if (isMainFrame) {
+                        setState(() {
+                          isLoading = false;
+                          hasError = true;
+                        });
+                      }
+                    },
+                    onNavigationRequest: (NavigationRequest request) {
+                      return NavigationDecision.navigate;
+                    },
+                  ),
+                );
+            }
+          
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                backgroundColor: Colors.white,
+                body: Stack(
+                  children: [
+                    if (!hasError) WebViewWidget(controller: controller),
+                    if (isLoading && !hasError)
+                      const Center(child: CircularProgressIndicator(color: Colors.blue, strokeWidth: 3)),
+                    if (hasError)
+                      Container(
+                        width: double.infinity,
+                        height: double.infinity,
+                        color: Colors.white,
+                        child: Center(
+                          child: Padding(
+                            padding: const EdgeInsets.all(24.0),
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                const Icon(Icons.wifi_off, size: 72, color: Colors.grey),
+                                const SizedBox(height: 20),
+                                const Text(
+                                  'Tidak Ada Koneksi Internet',
+                                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.black87),
+                                  textAlign: TextAlign.center,
+                                ),
+                                const SizedBox(height: 8),
+                                const Text(
+                                  'Periksa koneksi internet Anda, lalu coba lagi.',
+                                  style: TextStyle(fontSize: 14, color: Colors.grey),
+                                  textAlign: TextAlign.center,
+                                ),
+                                const SizedBox(height: 24),
+                                ElevatedButton.icon(
+                                  onPressed: _checkAndLoad,
+                                  icon: const Icon(Icons.refresh),
+                                  label: const Text('Coba Lagi'),
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: Colors.blue,
+                                    foregroundColor: Colors.white,
+                                    padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              );
+            }
+          }
+          EOF
+          
+          sed -i "s|APP_NAME_PLACEHOLDER|$APP_NAME|g" lib/main.dart
+          sed -i "s|ENCRYPTED_URL_PLACEHOLDER|$ENCRYPTED_URL|g" lib/main.dart
+          sed -i "s|ENCRYPTION_KEY_PLACEHOLDER|$ENCRYPTION_KEY|g" lib/main.dart
+          
+          echo "✅ Main.dart created (URL disimpan dalam bentuk terenkripsi)"
+
+      # ==================== UPDATE ANDROID MANIFEST ====================
+      - name: Update Android Manifest
+        run: |
+          cd "${{ steps.project.outputs.package_name }}"
+          
+          APP_NAME="${{ github.event.inputs.app_name }}"
+          
+          rm -f android/app/src/main/AndroidManifest.xml
+          
+          cat > android/app/src/main/AndroidManifest.xml << 'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="com.web2app.PACKAGE_NAME_PLACEHOLDER">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+              <application
+                  android:label="APP_NAME_PLACEHOLDER"
+                  android:name="${applicationName}"
+                  android:icon="@mipmap/ic_launcher"
+                  android:roundIcon="@mipmap/ic_launcher_round"
+                  android:usesCleartextTraffic="true"
+                  android:allowBackup="true"
+                  android:theme="@style/LaunchTheme">
+                  <meta-data android:name="flutterEmbedding" android:value="2" />
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:launchMode="singleTop"
+                      android:theme="@style/LaunchTheme"
+                      android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+                      android:hardwareAccelerated="true"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          
+          PACKAGE_NAME="${{ steps.project.outputs.package_name }}"
+          sed -i "s|PACKAGE_NAME_PLACEHOLDER|$PACKAGE_NAME|g" android/app/src/main/AndroidManifest.xml
+          sed -i "s|APP_NAME_PLACEHOLDER|$APP_NAME|g" android/app/src/main/AndroidManifest.xml
+
+      # ==================== UPDATE ANDROID GRADLE ====================
+      - name: Update Android Gradle
+        run: |
+          cd "${{ steps.project.outputs.package_name }}"
+          
+          PACKAGE_NAME="${{ steps.project.outputs.package_name }}"
+          
+          cat > android/gradle.properties << 'EOF'
+          org.gradle.jvmargs=-Xmx4G -XX:MaxMetaspaceSize=2G -XX:+HeapDumpOnOutOfMemoryError
+          android.useAndroidX=true
+          android.enableJetifier=true
+          android.enableR8=true
+          android.enableDexingArtifactTransform=true
+          EOF
+          
+          cat > android/settings.gradle << 'EOF'
+          pluginManagement {
+              def flutterSdkPath = {
+                  def properties = new Properties()
+                  file("local.properties").withInputStream { properties.load(it) }
+                  def flutterSdkPath = properties.getProperty("flutter.sdk")
+                  assert flutterSdkPath != null, "flutter.sdk not set in local.properties"
+                  return flutterSdkPath
+              }
+              settings.ext.flutterSdkPath = flutterSdkPath()
+              includeBuild("${settings.ext.flutterSdkPath}/packages/flutter_tools/gradle")
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          plugins {
+              id "dev.flutter.flutter-plugin-loader" version "1.0.0"
+              id "com.android.application" version "7.3.0" apply false
+              id "org.jetbrains.kotlin.android" version "1.9.22" apply false
+          }
+          include ":app"
+          EOF
+          
+          cat > android/build.gradle << 'EOF'
+          buildscript {
+              repositories { google(); mavenCentral() }
+              dependencies {
+                  classpath 'com.android.tools.build:gradle:7.3.0'
+                  classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.22"
+              }
+          }
+          allprojects {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.buildDir = '../build'
+          subprojects {
+              project.buildDir = "${rootProject.buildDir}/${project.name}"
+          }
+          subprojects {
+              project.evaluationDependsOn(':app')
+          }
+          tasks.register("clean", Delete) { delete rootProject.buildDir }
+          EOF
+          
+          cat > android/app/build.gradle << 'EOF'
+          plugins {
+              id "com.android.application"
+              id "kotlin-android"
+              id "dev.flutter.flutter-gradle-plugin"
+          }
+          android {
+              namespace "com.web2app.PACKAGE_NAME_PLACEHOLDER"
+              compileSdkVersion 34
+              ndkVersion flutter.ndkVersion
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+              sourceSets { main.java.srcDirs += 'src/main/kotlin' }
+              defaultConfig {
+                  applicationId "com.web2app.PACKAGE_NAME_PLACEHOLDER"
+                  minSdkVersion 21
+                  targetSdkVersion 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.debug
+                      minifyEnabled false
+                      shrinkResources false
+                      proguardFiles getDefaultProguardFile('proguard-android.txt')
+                  }
+              }
+          }
+          flutter { source '../..' }
+          dependencies {}
+          EOF
+          
+          sed -i "s|PACKAGE_NAME_PLACEHOLDER|$PACKAGE_NAME|g" android/app/build.gradle
+
+      # ==================== FLUTTER CLEAN & PUB GET ====================
+      - name: Flutter Clean & Pub Get
+        run: |
+          cd "${{ steps.project.outputs.package_name }}"
+          flutter clean
+          flutter pub get
+
+      # ==================== BUILD APK ====================
+      - name: Build APK
+        id: build
+        run: |
+          cd "${{ steps.project.outputs.package_name }}"
+          
+          echo "🔨 Building APK..."
+          flutter build apk --release --no-tree-shake-icons
+          
+          if [ -f "build/app/outputs/flutter-apk/app-release.apk" ]; then
+            APK_SIZE=$(du -h build/app/outputs/flutter-apk/app-release.apk | cut -f1)
+            echo "apk_size=$APK_SIZE" >> $GITHUB_OUTPUT
+            echo "✅ Build success! APK size: $APK_SIZE"
+          else
+            echo "❌ Build failed!"
+            find . -name "*.apk" -type f 2>/dev/null || echo "No APK found"
+            exit 1
+          fi
+
+      # ==================== UPLOAD ARTIFACT ====================
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: web2apk
+          path: ${{ steps.project.outputs.package_name }}/build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 7
+          compression-level: 9
+
+      - name: Cleanup
+        if: always()
+        run: |
+          echo "🧹 Cleaning up workspace..."
+          rm -rf ${{ steps.project.outputs.package_name }} 2>/dev/null || true
+          echo "✅ Cleanup completed"
