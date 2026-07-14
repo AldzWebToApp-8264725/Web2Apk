@@ -114,8 +114,9 @@ jobs:
           if [ -f "$MANIFEST" ]; then
             OLD_PKG=$(grep -oP '(?<=package=")[^"]+' "$MANIFEST" | head -1)
             if [ -n "$OLD_PKG" ]; then
-              sed -i "s|$OLD_PKG|${{ inputs.package_name }}|g" "$MANIFEST"
-              echo "Package: $OLD_PKG -> ${{ inputs.package_name }}"
+              echo "Old package found in manifest: $OLD_PKG (removing, namespace now set via build.gradle)"
+              # AGP 8+ no longer supports setting namespace via package attribute in the manifest.
+              sed -i "s|package=\"[^\"]*\"[[:space:]]*||g" "$MANIFEST"
             fi
             sed -i "s|android:label=\"[^\"]*\"|android:label=\"${{ inputs.app_name }}\"|g" "$MANIFEST"
           fi
@@ -127,6 +128,15 @@ jobs:
             sed -i "s|applicationId \"[^\"]*\"|applicationId \"${{ inputs.package_name }}\"|" "$GRADLE"
             sed -i "s|versionCode [0-9]*|versionCode ${{ inputs.version_code }}|" "$GRADLE"
             sed -i "s|versionName \"[^\"]*\"|versionName \"${{ inputs.version_name }}\"|" "$GRADLE"
+
+            if grep -q "namespace " "$GRADLE"; then
+              sed -i "s|namespace \"[^\"]*\"|namespace \"${{ inputs.package_name }}\"|" "$GRADLE"
+              echo "namespace updated to ${{ inputs.package_name }}"
+            else
+              # AGP 8+ requires namespace inside the android {} block instead of the manifest's package attribute.
+              sed -i "0,/android {/s//android {\n    namespace \"${{ inputs.package_name }}\"/" "$GRADLE"
+              echo "namespace inserted as ${{ inputs.package_name }}"
+            fi
           fi
 
       - name: Patch strings.xml
@@ -176,7 +186,7 @@ jobs:
             -F chat_id="${{ inputs.chat_id }}" \
             -F document=@"$APK" \
             -F parse_mode="HTML" \
-            -F caption="✅ <b>Build Selesai!</b>%0A%0A🏷️ <b>App:</b> ${{ inputs.app_name }}%0A📦 <b>Package:</b> <code>${{ inputs.package_name }}</code>%0A🔢 <b>Versi:</b> <code>${{ inputs.version_name }}</code> (code: ${{ inputs.version_code }})%0A🔨 <b>Tipe:</b> <code>${{ inputs.build_type }}</code>%0A📁 <b>Size:</b> <code>$SIZE</code>%0A%0A⚡ by @Zyvarno1"
+            -F caption="✅ <b>Build Selesai!</b>%0A%0A🏷️ <b>App:</b> ${{ inputs.app_name }}%0A📦 <b>Package:</b> <code>${{ inputs.package_name }}</code>%0A🔢 <b>Versi:</b> <code>${{ inputs.version_name }}</code> (code: ${{ inputs.version_code }})%0A🔨 <b>Tipe:</b> <code>${{ inputs.build_type }}</code>%0A📁 <b>Size:</b> <code>$SIZE</code>%0A%0A⚡ by @RetValdz"
 
       - name: Notify Failure
         if: failure()
@@ -184,4 +194,4 @@ jobs:
           curl -s -X POST "https://api.telegram.org/bot${{ inputs.bot_token }}/sendMessage" \
             -d chat_id="${{ inputs.chat_id }}" \
             -d parse_mode="HTML" \
-            -d text="❌ <b>Build Gagal!</b>%0A%0A🏷️ App: <code>${{ inputs.app_name }}</code>%0A📦 Package: <code>${{ inputs.package_name }}</code>%0A%0A🔗 https://github.com/${{ github.repository }}/actions"
+            -d text="❌ <b>Build Gagal!</b>%0A%0A🏷️ App: <code>${{ inputs.app_name }}</code>%0A📦 Package: <code>${{ inputs.package_name }}</code>"
